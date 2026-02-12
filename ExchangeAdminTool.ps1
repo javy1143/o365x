@@ -152,7 +152,7 @@ function New-LabeledTextBox {
     $Parent.Controls.Add($lbl)
 
     $txt = New-Object System.Windows.Forms.TextBox
-    $txt.Location = New-Object System.Drawing.Point($X, ($Y + 20))
+    $txt.Location = New-Object System.Drawing.Point($X, $Y + 20)
     $txt.Size = New-Object System.Drawing.Size($Width, 24)
     $Parent.Controls.Add($txt)
 
