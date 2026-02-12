@@ -171,15 +171,47 @@ function Set-ResultGrid {
     param([System.Windows.Forms.DataGridView]$Grid,[object[]]$Data,[string]$NoDataMessage = 'No data returned.')
 
     $Grid.DataSource = $null
+    $Grid.Rows.Clear()
     $Grid.Columns.Clear()
-    $Grid.AutoGenerateColumns = $true
 
-    if (-not $Data -or $Data.Count -eq 0) {
-        $Grid.DataSource = ConvertTo-DataTable -InputObject @([pscustomobject]@{ Result = $NoDataMessage })
+    $rows = @($Data)
+    if (-not $rows -or $rows.Count -eq 0) {
+        [void]$Grid.Columns.Add('Result','Result')
+        [void]$Grid.Rows.Add($NoDataMessage)
         return
     }
 
-    $Grid.DataSource = ConvertTo-DataTable -InputObject $Data
+    $propertyNames = New-Object System.Collections.Generic.List[string]
+    foreach ($row in $rows) {
+        foreach ($prop in $row.PSObject.Properties) {
+            if ($prop.MemberType -in @('NoteProperty','Property') -and -not $propertyNames.Contains($prop.Name)) {
+                [void]$propertyNames.Add($prop.Name)
+            }
+        }
+    }
+
+    if ($propertyNames.Count -eq 0) {
+        [void]$Grid.Columns.Add('Value','Value')
+        foreach ($row in $rows) { [void]$Grid.Rows.Add([string]$row) }
+        return
+    }
+
+    foreach ($name in $propertyNames) {
+        [void]$Grid.Columns.Add($name,$name)
+    }
+
+    foreach ($row in $rows) {
+        $values = @()
+        foreach ($name in $propertyNames) {
+            $propObj = $row.PSObject.Properties[$name]
+            $val = if ($null -ne $propObj) { $propObj.Value } else { '' }
+            if ($val -is [System.Array]) { $val = ($val -join ', ') }
+            if ($null -eq $val) { $val = '' }
+            $values += [string]$val
+        }
+        [void]$Grid.Rows.Add($values)
+    }
+
     $Grid.Refresh()
 }
 
@@ -190,6 +222,26 @@ function Set-ComboValues {
         [void]$Combo.Items.AddRange($Values)
         if ($Combo.Items.Count -gt 0) { $Combo.SelectedIndex = 0 }
     }
+}
+
+function Connect-ExchangeSession {
+    param([string]$AdminUpn)
+
+    $connectCmd = Get-Command Connect-ExchangeOnline -ErrorAction Stop
+
+    if ($PSVersionTable.PSEdition -eq 'Desktop' -and $connectCmd.Parameters.ContainsKey('UseWebLogin')) {
+        Write-Log -Message 'Connecting in Windows PowerShell mode (UseWebLogin)...' -Level Info
+        Connect-ExchangeOnline -UserPrincipalName $AdminUpn -UseWebLogin -ShowBanner:$false -ErrorAction Stop
+        return
+    }
+
+    if ($connectCmd.Parameters.ContainsKey('Device')) {
+        Write-Log -Message 'Connecting with device authentication flow...' -Level Info
+        Connect-ExchangeOnline -UserPrincipalName $AdminUpn -Device -ShowBanner:$false -ErrorAction Stop
+        return
+    }
+
+    Connect-ExchangeOnline -UserPrincipalName $AdminUpn -ShowBanner:$false -ErrorAction Stop
 }
 
 function Refresh-DistributionGroups {
@@ -379,13 +431,7 @@ $btnConnect.Add_Click({
     if ([string]::IsNullOrWhiteSpace($adminUpn)) { Write-Log -Message 'Enter an admin UPN before connecting.' -Level Warning; return }
 
     global:InvokeSafely -Script {
-        if ($PSVersionTable.PSEdition -eq 'Desktop') {
-            Write-Log -Message 'Connecting in Windows PowerShell mode (UseWebLogin)...' -Level Info
-            Connect-ExchangeOnline -UserPrincipalName $adminUpn -UseWebLogin -ShowBanner:$false
-        }
-        else {
-            Connect-ExchangeOnline -UserPrincipalName $adminUpn -ShowBanner:$false
-        }
+        Connect-ExchangeSession -AdminUpn $adminUpn
         $script:IsConnected = $true
         Refresh-DistributionGroups
     } -SuccessMessage "Connected to Exchange Online as $adminUpn" -ErrorPrefix 'Connection failed'

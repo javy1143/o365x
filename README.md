@@ -22,7 +22,7 @@ The UI uses a custom palette based on your logo tones:
 ## Requirements
 - Windows PowerShell 5.1+ (or PowerShell 7 with WinForms support on Windows)
 - Exchange Online PowerShell module:
-- Windows PowerShell 5.1 uses ExchangeOnline `-UseWebLogin` flow in this tool to reduce connection hangs in legacy host.
+- In Windows PowerShell 5.1 the tool auto-detects supported interactive auth parameters (`UseWebLogin` / `Device`) and falls back automatically.
 
 ```powershell
 Install-Module ExchangeOnlineManagement -Scope CurrentUser
