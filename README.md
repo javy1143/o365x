@@ -7,9 +7,9 @@ This repository contains `ExchangeAdminTool.ps1`, a Windows Forms GUI for Exchan
 - Mailbox permission management (Full Access, Send As, Send On Behalf)
 - Calendar permission management
 - Distribution group member management with dropdown of current groups
+- Each management tab includes a "View Current" button and results grid
 - Shared mailbox access assignment/removal
 - Out-of-office (automatic replies) enable/disable
-- Current permissions viewer tab for mailbox/calendar/groups/shared mailbox/OOF
 
 ## Color palette
 The UI uses a custom palette based on your logo tones:
