@@ -146,14 +146,14 @@ function New-LabeledTextBox {
 
     $lbl = New-Object System.Windows.Forms.Label
     $lbl.Text = $Label
-    $lbl.Location = [System.Drawing.Point]::new([int]$X, [int]$Y)
+    $lbl.Location = New-Object System.Drawing.Point($X, $Y)
     $lbl.AutoSize = $true
     $lbl.ForeColor = $Theme.Text
     $Parent.Controls.Add($lbl)
 
     $txt = New-Object System.Windows.Forms.TextBox
-    $txt.Location = [System.Drawing.Point]::new([int]$X, [int]($Y + 20))
-    $txt.Size = [System.Drawing.Size]::new([int]$Width, 24)
+    $txt.Location = New-Object System.Drawing.Point($X, $Y + 20)
+    $txt.Size = New-Object System.Drawing.Size($Width, 24)
     $Parent.Controls.Add($txt)
 
     return $txt
@@ -171,8 +171,8 @@ function New-ThemeButton {
 
     $btn = New-Object System.Windows.Forms.Button
     $btn.Text = $Text
-    $btn.Location = [System.Drawing.Point]::new([int]$X, [int]$Y)
-    $btn.Size = [System.Drawing.Size]::new([int]$Width, 32)
+    $btn.Location = New-Object System.Drawing.Point($X, $Y)
+    $btn.Size = New-Object System.Drawing.Size($Width, 32)
     $btn.BackColor = $BackColor
     $btn.ForeColor = [System.Drawing.Color]::White
     $btn.FlatStyle = 'Flat'
