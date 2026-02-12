@@ -47,12 +47,17 @@ function global:InvokeSafely {
         [string]$ErrorPrefix = 'Operation failed'
     )
 
+    $previousErrorActionPreference = $ErrorActionPreference
     try {
+        $ErrorActionPreference = 'Stop'
         & $Script
         if ($SuccessMessage) { Write-Log -Message $SuccessMessage -Level Success }
     }
     catch {
         Write-Log -Message "${ErrorPrefix}: $($_.Exception.Message)" -Level Error
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
     }
 }
 
@@ -163,9 +168,19 @@ function ConvertTo-DataTable {
 }
 
 function Set-ResultGrid {
-    param([System.Windows.Forms.DataGridView]$Grid,[object[]]$Data)
-    if (-not $Data -or $Data.Count -eq 0) { $Grid.DataSource = $null; return }
+    param([System.Windows.Forms.DataGridView]$Grid,[object[]]$Data,[string]$NoDataMessage = 'No data returned.')
+
+    $Grid.DataSource = $null
+    $Grid.Columns.Clear()
+    $Grid.AutoGenerateColumns = $true
+
+    if (-not $Data -or $Data.Count -eq 0) {
+        $Grid.DataSource = ConvertTo-DataTable -InputObject @([pscustomobject]@{ Result = $NoDataMessage })
+        return
+    }
+
     $Grid.DataSource = ConvertTo-DataTable -InputObject $Data
+    $Grid.Refresh()
 }
 
 function Set-ComboValues {
@@ -179,7 +194,7 @@ function Set-ComboValues {
 
 function Refresh-DistributionGroups {
     Assert-Connected
-    $groups = Get-DistributionGroup -ResultSize Unlimited | Sort-Object DisplayName
+    $groups = Get-DistributionGroup -ResultSize Unlimited -ErrorAction Stop | Sort-Object DisplayName
     Set-ComboValues -Combo $cmbGroupName -Values @($groups | ForEach-Object { $_.PrimarySmtpAddress.ToString() })
 }
 
@@ -364,7 +379,13 @@ $btnConnect.Add_Click({
     if ([string]::IsNullOrWhiteSpace($adminUpn)) { Write-Log -Message 'Enter an admin UPN before connecting.' -Level Warning; return }
 
     global:InvokeSafely -Script {
-        Connect-ExchangeOnline -UserPrincipalName $adminUpn -ShowBanner:$false
+        if ($PSVersionTable.PSEdition -eq 'Desktop') {
+            Write-Log -Message 'Connecting in Windows PowerShell mode (UseWebLogin)...' -Level Info
+            Connect-ExchangeOnline -UserPrincipalName $adminUpn -UseWebLogin -ShowBanner:$false
+        }
+        else {
+            Connect-ExchangeOnline -UserPrincipalName $adminUpn -ShowBanner:$false
+        }
         $script:IsConnected = $true
         Refresh-DistributionGroups
     } -SuccessMessage "Connected to Exchange Online as $adminUpn" -ErrorPrefix 'Connection failed'
@@ -409,14 +430,14 @@ $btnViewPerms.Add_Click({
         if ([string]::IsNullOrWhiteSpace($mailbox)) { throw 'Enter a target mailbox first.' }
 
         $rows = @()
-        $rows += Get-MailboxPermission -Identity $mailbox |
+        $rows += Get-MailboxPermission -Identity $mailbox -ErrorAction Stop |
             Where-Object { -not $_.IsInherited -and $_.User -ne 'NT AUTHORITY\SELF' } |
             ForEach-Object { [pscustomobject]@{ Type='Mailbox'; User=$_.User; Rights=($_.AccessRights -join ','); Inherited=$_.IsInherited } }
 
-        $rows += Get-RecipientPermission -Identity $mailbox -ErrorAction SilentlyContinue |
+        $rows += Get-RecipientPermission -Identity $mailbox -ErrorAction Stop |
             ForEach-Object { [pscustomobject]@{ Type='Recipient'; User=$_.Trustee; Rights=($_.AccessRights -join ','); Inherited='' } }
 
-        $sendOnBehalf = (Get-Mailbox -Identity $mailbox).GrantSendOnBehalfTo
+        $sendOnBehalf = (Get-Mailbox -Identity $mailbox -ErrorAction Stop).GrantSendOnBehalfTo
         foreach ($entry in $sendOnBehalf) {
             $rows += [pscustomobject]@{ Type='SendOnBehalf'; User=$entry; Rights='SendOnBehalf'; Inherited='' }
         }
@@ -444,7 +465,7 @@ $btnViewCalPerms.Add_Click({
         Assert-Connected
         $mailbox = $txtCalMailbox.Text.Trim()
         if ([string]::IsNullOrWhiteSpace($mailbox)) { throw 'Enter mailbox owner first.' }
-        $data = Get-MailboxFolderPermission -Identity "$mailbox`:\Calendar" | Select-Object User,AccessRights,SharingPermissionFlags
+        $data = Get-MailboxFolderPermission -Identity "$mailbox`:\Calendar" -ErrorAction Stop | Select-Object User,AccessRights,SharingPermissionFlags
         Set-ResultGrid -Grid $gridCal -Data $data
     } -SuccessMessage 'Current calendar permissions loaded.'
 })
@@ -479,7 +500,7 @@ $btnViewGroupMembers.Add_Click({
         Assert-Connected
         $groupIdentity = $cmbGroupName.SelectedItem
         if (-not $groupIdentity) { throw 'Select a distribution group first.' }
-        $data = Get-DistributionGroupMember -Identity $groupIdentity -ResultSize Unlimited | Select-Object Name,PrimarySmtpAddress,RecipientType
+        $data = Get-DistributionGroupMember -Identity $groupIdentity -ResultSize Unlimited -ErrorAction Stop | Select-Object Name,PrimarySmtpAddress,RecipientType
         Set-ResultGrid -Grid $gridGroups -Data $data
     } -SuccessMessage 'Current group membership loaded.'
 })
@@ -508,10 +529,10 @@ $btnViewSharedPerms.Add_Click({
         $mailbox = $txtSharedMailbox.Text.Trim()
         if ([string]::IsNullOrWhiteSpace($mailbox)) { throw 'Enter a shared mailbox first.' }
         $rows = @()
-        $rows += Get-MailboxPermission -Identity $mailbox |
+        $rows += Get-MailboxPermission -Identity $mailbox -ErrorAction Stop |
             Where-Object { -not $_.IsInherited -and $_.User -ne 'NT AUTHORITY\SELF' } |
             Select-Object @{n='Type';e={'Mailbox'}},User,@{n='Rights';e={$_.AccessRights -join ','}}
-        $rows += Get-RecipientPermission -Identity $mailbox -ErrorAction SilentlyContinue |
+        $rows += Get-RecipientPermission -Identity $mailbox -ErrorAction Stop |
             Select-Object @{n='Type';e={'Recipient'}},@{n='User';e={$_.Trustee}},@{n='Rights';e={$_.AccessRights -join ','}}
         Set-ResultGrid -Grid $gridShared -Data $rows
     } -SuccessMessage 'Current shared mailbox access loaded.'
@@ -536,7 +557,7 @@ $btnViewOOF.Add_Click({
         Assert-Connected
         $mailbox = $txtOOFMailbox.Text.Trim()
         if ([string]::IsNullOrWhiteSpace($mailbox)) { throw 'Enter a mailbox first.' }
-        $cfg = Get-MailboxAutoReplyConfiguration -Identity $mailbox
+        $cfg = Get-MailboxAutoReplyConfiguration -Identity $mailbox -ErrorAction Stop
         $data = @([pscustomobject]@{
             Identity         = $cfg.Identity
             AutoReplyState   = $cfg.AutoReplyState
