@@ -2,7 +2,7 @@
 # Script:           ExchangeAdminTool.ps1
 # Description:      A fully asynchronous, multi-tenant capable GUI for managing
 #                   Exchange Online. Prevents UI freezing using Runspaces.
-# Version:          2.0
+# Version:          2.1
 # ==============================================================================
 
 #Requires -Version 5.1
@@ -26,22 +26,30 @@ public class DpiHelper {
 # ==============================================================================
 # 1. Global Variables & Theme Setup
 # ==============================================================================
-$script:Runspace      = $null
-$script:PS            = $null
-$script:AsyncResult   = $null
-$script:IsConnected   = $false
-$script:CurrentAction = ''
+$script:Runspace        = $null
+$script:PS              = $null
+$script:AsyncResult     = $null
+$script:IsConnected     = $false
+$script:CurrentAction   = ''
+$script:ConnectedDomain = ''   # Populated on successful connect; used by Resolve-Identity
 
-# Robust script directory detection — works when dot-sourced, run via F5 in ISE, or invoked directly
-$script:ScriptDir = if ($PSScriptRoot -and $PSScriptRoot -ne '') {
-    $PSScriptRoot
-} elseif ($MyInvocation.MyCommand.Path -and $MyInvocation.MyCommand.Path -ne '') {
-    Split-Path -Parent $MyInvocation.MyCommand.Path
-} else {
-    $PWD.Path
+# Robust script directory detection — StrictMode-safe
+$script:ScriptDir = $null
+if ($PSScriptRoot -and $PSScriptRoot -ne '') {
+    $script:ScriptDir = $PSScriptRoot
 }
-# Always guarantee a non-null log path — fallback to TEMP if ScriptDir is somehow still empty
+if (-not $script:ScriptDir) {
+    try {
+        $cmdPath = $MyInvocation.MyCommand | Select-Object -ExpandProperty Path -ErrorAction SilentlyContinue
+        if ($cmdPath) { $script:ScriptDir = Split-Path -Parent $cmdPath }
+    } catch { <# Property doesn't exist in all hosts #> }
+}
+if (-not $script:ScriptDir) {
+    $script:ScriptDir = $PWD.Path
+}
+# Final fallback — guarantee non-null
 if (-not $script:ScriptDir -or $script:ScriptDir -eq '') { $script:ScriptDir = $env:TEMP }
+
 $script:LogFilePath = Join-Path $script:ScriptDir "ExchangeAdminTool_$(Get-Date -Format 'yyyyMMdd').log"
 
 $Theme = @{
@@ -60,8 +68,8 @@ $Theme = @{
 }
 
 # Find script directory for logo
-$scriptDir = $script:ScriptDir
-$logoPath  = Join-Path $scriptDir "StackPoint IT Logo (no background).png"
+$logoPath = $null
+try { $logoPath = Join-Path $script:ScriptDir "StackPoint IT Logo (no background).png" } catch {}
 
 # ==============================================================================
 # 2. UI Helper Functions
@@ -129,8 +137,6 @@ function New-Button  { param($Text,$X,$Y,$W,$H,$BgColor)
     $c.FlatStyle = 'Flat'; $c.FlatAppearance.BorderSize = 0
     $c.Font = [System.Drawing.Font]::new("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
     $c.Cursor = [System.Windows.Forms.Cursors]::Hand
-    # Store original color in Tag so the MouseLeave closure can read it via $this at call-time
-    # (PowerShell scriptblock closures do NOT capture local param variables by value)
     $c.Tag = $BgColor
     $c.Add_MouseEnter({ $this.BackColor = [System.Drawing.Color]::FromArgb([Math]::Min(255,$this.BackColor.R+25),[Math]::Min(255,$this.BackColor.G+25),[Math]::Min(255,$this.BackColor.B+25)) })
     $c.Add_MouseLeave({ $this.BackColor = $this.Tag })
@@ -151,6 +157,22 @@ function New-Separator { param($X,$Y,$W)
     $c.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#444444"); return $c }
 
 # ==============================================================================
+# 2b. Identity Resolution Helper
+# ==============================================================================
+# Appends the connected tenant domain when the user types just a username (no @).
+# Passes through any value that already contains '@' unchanged.
+function Resolve-Identity {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $Value }
+    if ($Value.Contains('@')) { return $Value }
+    if ($script:ConnectedDomain) {
+        return "$Value@$($script:ConnectedDomain)"
+    }
+    # No domain available yet — return as-is and let Exchange resolve by alias
+    return $Value
+}
+
+# ==============================================================================
 # 3. Pre-flight Module Check
 # ==============================================================================
 function Test-ExchangeModule {
@@ -167,7 +189,7 @@ function Test-ExchangeModule {
 # 6. Main Form Construction
 # ==============================================================================
 $Form = New-Object System.Windows.Forms.Form
-$Form.Text            = "StackPoint IT - Exchange Online Admin Tool v2.0"
+$Form.Text            = "StackPoint IT - Exchange Online Admin Tool v2.1"
 $Form.Size            = [System.Drawing.Size]::new(820, 900)
 $Form.MinimumSize     = [System.Drawing.Size]::new(820, 900)
 $Form.BackColor       = $Theme.Background
@@ -184,7 +206,7 @@ $HeaderPanel.Size      = [System.Drawing.Size]::new(820, 65)
 $HeaderPanel.BackColor = $Theme.Panel
 $HeaderPanel.Anchor    = "Top, Left, Right"
 
-if (Test-Path $logoPath) {
+if ($logoPath -and (Test-Path $logoPath)) {
     $LogoBox          = New-Object System.Windows.Forms.PictureBox
     $LogoBox.Image    = [System.Drawing.Image]::FromFile($logoPath)
     $LogoBox.SizeMode = "Zoom"
@@ -263,9 +285,15 @@ $script:JobTimer.add_Tick({
 
         if ($results) {
             $sentinel    = $results | Where-Object { $_ -eq '__CONNECTED__' }
+            $domainLines = $results | Where-Object { $_ -like '__DOMAIN__*' }
             $rowLines    = $results | Where-Object { $_ -like '__ROW__*' }
             $clearGrid   = $results | Where-Object { $_ -eq '__CLEARGRID__' }
-            $outputLines = $results | Where-Object { $_ -ne '__CONNECTED__' -and $_ -notlike '__ROW__*' -and $_ -ne '__CLEARGRID__' }
+            $outputLines = $results | Where-Object { $_ -ne '__CONNECTED__' -and $_ -notlike '__ROW__*' -and $_ -ne '__CLEARGRID__' -and $_ -notlike '__DOMAIN__*' }
+
+            # Capture connected domain from sentinel
+            foreach ($dl in $domainLines) {
+                $script:ConnectedDomain = ($dl -replace '^__DOMAIN__\|','').Trim()
+            }
 
             # Populate results grid if we got structured rows
             if ($clearGrid -or $rowLines) {
@@ -275,9 +303,7 @@ $script:JobTimer.add_Tick({
                 })
             }
             foreach ($rowLine in $rowLines) {
-                # Format: __ROW__|Mailbox|PermType|UserOrTrustee|Extra
                 $parts = ($rowLine -replace '^__ROW__\|','') -split '\|'
-                # Build the ListViewItem synchronously here (outside Invoke) to avoid closure capture issues
                 $li = New-Object System.Windows.Forms.ListViewItem($parts[0])
                 $li.SubItems.Add($(if ($parts.Count -gt 1) { $parts[1] } else { '' })) | Out-Null
                 $li.SubItems.Add($(if ($parts.Count -gt 2) { $parts[2] } else { '' })) | Out-Null
@@ -287,7 +313,7 @@ $script:JobTimer.add_Tick({
             }
             if ($rowLines) {
                 $count = @($rowLines).Count
-                $Form.Invoke([action]{ $ResultsHeaderLabel.Text = "Current Delegates  ($count entries — select rows to remove)" })
+                $Form.Invoke([action]{ $ResultsHeaderLabel.Text = "Current Delegates  ($count entries - select rows to remove)" })
             }
 
             $output = $outputLines | Out-String
@@ -316,16 +342,18 @@ $script:JobTimer.add_Tick({
             if ($errorCount -eq -1) {
                 $script:IsConnected = $true
                 $Form.Invoke([action]{
-                    $StatusLabel.Text      = "Status: Connected"
+                    $StatusLabel.Text      = "Status: Connected ($($script:ConnectedDomain))"
                     $StatusLabel.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#28A745")
                 })
-                Write-Log "Successfully connected to Exchange Online." ([System.Drawing.ColorTranslator]::FromHtml("#28A745"))
+                Write-Log "Successfully connected to Exchange Online ($($script:ConnectedDomain))." ([System.Drawing.ColorTranslator]::FromHtml("#28A745"))
             } else {
                 $script:IsConnected = $false
+                $script:ConnectedDomain = ''
                 Write-Log "Connection failed. Check credentials and module." ([System.Drawing.ColorTranslator]::FromHtml("#DC3545"))
             }
         } elseif ($script:CurrentAction -eq 'Disconnect') {
             $script:IsConnected = $false
+            $script:ConnectedDomain = ''
             Remove-Runspace
             $Form.Invoke([action]{
                 $StatusLabel.Text      = "Status: Disconnected"
@@ -372,7 +400,7 @@ function Invoke-ExchangeCommand {
         $script:Runspace.SessionStateProxy.SetVariable('ErrorActionPreference', 'Stop')
     }
 
-    # Safely inject caller variables into runspace scope (fixes $using: bug)
+    # Safely inject caller variables into runspace scope
     foreach ($key in $Variables.Keys) {
         $script:Runspace.SessionStateProxy.SetVariable($key, $Variables[$key])
     }
@@ -386,35 +414,35 @@ function Invoke-ExchangeCommand {
 # ==============================================================================
 # 7. TAB 1 — Connection
 # ==============================================================================
-$TabConnect = New-Tab "🔌 Connection"
+$TabConnect = New-Tab "Connection"
 
 $lblUPN       = New-Label "Admin UPN (e.g. admin@contoso.com):" 15 20 310 20
 $txtUPN       = New-TextBox 15 42 310 26 "admin@domain.com"
 $txtUPN.Font  = [System.Drawing.Font]::new("Segoe UI", 9)
 
-$lblOrg       = New-Label "Organization (optional — for delegated access):" 15 80 360 20
-$txtOrg       = New-TextBox 15 102 310 26 "contoso.onmicrosoft.com"
-
-$btnConnect    = New-Button "⚡ Connect" 15 148 140 36 $Theme.Accent
-$btnDisconnect = New-Button "✖ Disconnect" 170 148 140 36 $Theme.Panel
+$btnConnect    = New-Button "Connect" 15 88 140 36 $Theme.Accent
+$btnDisconnect = New-Button "Disconnect" 170 88 140 36 $Theme.Panel
 
 $btnConnect.Add_Click({
     $upn = Get-TextValue $txtUPN
-    $org = Get-TextValue $txtOrg
     if (-not $upn) { Write-Log "Admin UPN is required." $Theme.Warning; return }
+    if (-not $upn.Contains('@')) { Write-Log "Enter a full UPN with domain (e.g. admin@contoso.com)." $Theme.Warning; return }
     if (-not (Test-ExchangeModule)) { return }
 
-    Invoke-ExchangeCommand -ActionName 'Connect' -Variables @{ upn = $upn; org = $org } -ScriptBlock {
+    # Extract the domain portion from the UPN for org auto-detection
+    $domain = $upn.Split('@')[-1]
+
+    Invoke-ExchangeCommand -ActionName 'Connect' -Variables @{ upn = $upn; domain = $domain } -ScriptBlock {
         Import-Module ExchangeOnlineManagement -ErrorAction Stop
         $params = @{
             UserPrincipalName = $upn
             ShowProgress      = $false
             ShowBanner        = $false
         }
-        if ($org) { $params['DelegatedOrganization'] = $org }
         Connect-ExchangeOnline @params
         # Sentinel — verifies cmdlets are available
         Get-Mailbox -ResultSize 1 -ErrorAction Stop | Out-Null
+        Write-Output "__DOMAIN__|$domain"
         Write-Output '__CONNECTED__'
     }
 })
@@ -426,44 +454,48 @@ $btnDisconnect.Add_Click({
     }
 })
 
-$sep1 = New-Separator 15 200 730
-$lblConnNote = New-Label "💡 Tip: For multi-tenant / partner admin, fill in the Organization field with the customer tenant domain." 15 210 700 36
+$sep1 = New-Separator 15 140 730
+$lblConnNote = New-Label "The tenant organization is auto-detected from your sign-in domain. Just enter your admin UPN and connect." 15 150 700 36
 $lblConnNote.ForeColor = $Theme.TextDark
 $lblConnNote.Font      = [System.Drawing.Font]::new("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
 
-$TabConnect.Controls.AddRange(@($lblUPN,$txtUPN,$lblOrg,$txtOrg,$btnConnect,$btnDisconnect,$sep1,$lblConnNote))
+$lblInputNote = New-Label "All input fields across the tool accept short usernames (e.g. `"jsmith`") in addition to full email addresses. The connected domain is appended automatically." 15 185 700 36
+$lblInputNote.ForeColor = $Theme.TextDark
+$lblInputNote.Font      = [System.Drawing.Font]::new("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
+
+$TabConnect.Controls.AddRange(@($lblUPN,$txtUPN,$btnConnect,$btnDisconnect,$sep1,$lblConnNote,$lblInputNote))
 
 # ==============================================================================
 # 8. TAB 2 — Mailbox Permissions
 # ==============================================================================
-$TabPerms = New-Tab "🔑 Mailbox Permissions"
+$TabPerms = New-Tab "Mailbox Permissions"
 
-$lblTargetMbx  = New-Label "Target Mailbox (UPN or Alias):" 15 15 230 20
-$txtTargetMbx  = New-TextBox 15 36 230 26 "target@domain.com"
+$lblTargetMbx  = New-Label "Target Mailbox (UPN or Username):" 15 15 280 20
+$txtTargetMbx  = New-TextBox 15 36 230 26 "username or user@domain.com"
 
-$lblUserGroup  = New-Label "User / Group to Grant or Remove:" 265 15 230 20
-$txtUserGroup  = New-TextBox 265 36 230 26 "user@domain.com"
+$lblUserGroup  = New-Label "User / Group to Grant or Remove:" 265 15 280 20
+$txtUserGroup  = New-TextBox 265 36 230 26 "username or user@domain.com"
 
-$btnValidateMbx = New-Button "🔍 Validate" 510 34 100 28 $Theme.Panel
+$btnValidateMbx = New-Button "Validate" 510 34 100 28 $Theme.Panel
 $btnValidateMbx.Font = [System.Drawing.Font]::new("Segoe UI", 8)
 $btnValidateMbx.Add_Click({
-    $mbx = Get-TextValue $txtTargetMbx
+    $mbx = Resolve-Identity (Get-TextValue $txtTargetMbx)
     if (-not $mbx) { Write-Log "Enter a mailbox to validate." $Theme.Warning; return }
     Invoke-ExchangeCommand -ActionName 'Validate Mailbox' -Variables @{ mbx = $mbx } -ScriptBlock {
         $result = Get-Mailbox -Identity $mbx -ErrorAction Stop | Select-Object DisplayName, PrimarySmtpAddress, RecipientTypeDetails
-        Write-Output "✔ Found: $($result.DisplayName) | $($result.PrimarySmtpAddress) | $($result.RecipientTypeDetails)"
+        Write-Output "Found: $($result.DisplayName) | $($result.PrimarySmtpAddress) | $($result.RecipientTypeDetails)"
     }
 })
 
 $lblPermType  = New-Label "Permission Type:" 15 78 150 20
 $cmbPermType  = New-ComboBox 15 98 200 26 @("FullAccess","SendAs","SendOnBehalf","Calendar - Reviewer","Calendar - Editor","Calendar - Owner")
 
-$btnGetPerms  = New-Button "📋 Get All Permissions" 15 145 175 34 $Theme.Panel
-$btnAddPerm   = New-Button "✅ Add Permission"       205 145 150 34 $Theme.Accent
-$btnRemPerm   = New-Button "🗑 Remove Permission"    370 145 150 34 $Theme.Error
+$btnGetPerms  = New-Button "Get All Permissions" 15 145 175 34 $Theme.Panel
+$btnAddPerm   = New-Button "Add Permission"       205 145 150 34 $Theme.Accent
+$btnRemPerm   = New-Button "Remove Permission"    370 145 150 34 $Theme.Error
 
 $btnGetPerms.Add_Click({
-    $mbx = Get-TextValue $txtTargetMbx
+    $mbx = Resolve-Identity (Get-TextValue $txtTargetMbx)
     if (-not $mbx) { Write-Log "Target Mailbox required." $Theme.Warning; return }
     Invoke-ExchangeCommand -ActionName 'Get Permissions' -Variables @{ mbx = $mbx } -ScriptBlock {
         Write-Output '__CLEARGRID__'
@@ -501,23 +533,22 @@ $btnGetPerms.Add_Click({
 })
 
 $btnAddPerm.Add_Click({
-    $mbx  = Get-TextValue $txtTargetMbx
-    $user = Get-TextValue $txtUserGroup
+    $mbx  = Resolve-Identity (Get-TextValue $txtTargetMbx)
+    $user = Resolve-Identity (Get-TextValue $txtUserGroup)
     $type = $cmbPermType.Text
     if (-not $mbx -or -not $user) { Write-Log "Mailbox and User are required." $Theme.Warning; return }
 
     Invoke-ExchangeCommand -ActionName "Add $type" -Variables @{ mbx=$mbx; user=$user; type=$type } -ScriptBlock {
         switch -Wildcard ($type) {
-            "FullAccess"   { Add-MailboxPermission    -Identity $mbx -User $user -AccessRights FullAccess -InheritanceType All -AutoMapping $true -Confirm:$false }
+            "FullAccess"   { Add-MailboxPermission    -Identity $mbx -User $user -AccessRights FullAccess -InheritanceType All -AutoMapping $false -Confirm:$false }
             "SendAs"       { Add-RecipientPermission  -Identity $mbx -Trustee $user -AccessRights SendAs -Confirm:$false }
             "SendOnBehalf" { Set-Mailbox -Identity $mbx -GrantSendOnBehalfTo @{Add=$user} }
             "Calendar*"    {
-                $level = $type.Split(' - ')[-1]   # "Reviewer", "Editor", or "Owner"
+                $level = $type.Split(' - ')[-1]
                 $calFolder = Get-MailboxFolderStatistics -Identity $mbx |
                     Where-Object { $_.FolderType -eq 'Calendar' } | Select-Object -First 1
                 if (-not $calFolder) { throw "Could not locate Calendar folder for $mbx" }
                 $calPath = "$($mbx):\$($calFolder.FolderPath.TrimStart('/').Replace('/','\'))"
-                # Check if permission already exists — update instead of add
                 $existing = Get-MailboxFolderPermission -Identity $calPath -User $user -ErrorAction SilentlyContinue
                 if ($existing) {
                     Set-MailboxFolderPermission -Identity $calPath -User $user -AccessRights $level -Confirm:$false
@@ -531,8 +562,8 @@ $btnAddPerm.Add_Click({
 })
 
 $btnRemPerm.Add_Click({
-    $mbx  = Get-TextValue $txtTargetMbx
-    $user = Get-TextValue $txtUserGroup
+    $mbx  = Resolve-Identity (Get-TextValue $txtTargetMbx)
+    $user = Resolve-Identity (Get-TextValue $txtUserGroup)
     $type = $cmbPermType.Text
     if (-not $mbx -or -not $user) { Write-Log "Mailbox and User are required." $Theme.Warning; return }
 
@@ -546,12 +577,11 @@ $btnRemPerm.Add_Click({
                     Where-Object { $_.FolderType -eq 'Calendar' } | Select-Object -First 1
                 if (-not $calFolder) { throw "Could not locate Calendar folder for $mbx" }
                 $calPath = "$($mbx):\$($calFolder.FolderPath.TrimStart('/').Replace('/','\'))"
-                # Guard: verify permission exists before attempting removal
                 $existing = Get-MailboxFolderPermission -Identity $calPath -User $user -ErrorAction SilentlyContinue
                 if ($existing) {
                     Remove-MailboxFolderPermission -Identity $calPath -User $user -Confirm:$false
                 } else {
-                    Write-Output "No calendar permission found for $user on $mbx — nothing to remove."
+                    Write-Output "No calendar permission found for $user on $mbx - nothing to remove."
                 }
             }
         }
@@ -565,13 +595,13 @@ $TabPerms.Controls.AddRange(@($lblTargetMbx,$txtTargetMbx,$lblUserGroup,$txtUser
 # ==============================================================================
 # 9. TAB 3 — Mail Forwarding
 # ==============================================================================
-$TabFwd = New-Tab "📨 Mail Forwarding"
+$TabFwd = New-Tab "Mail Forwarding"
 
-$lblFwdMbx  = New-Label "Target Mailbox (UPN or Alias):" 15 15 230 20
-$txtFwdMbx  = New-TextBox 15 36 230 26 "target@domain.com"
+$lblFwdMbx  = New-Label "Target Mailbox (UPN or Username):" 15 15 280 20
+$txtFwdMbx  = New-TextBox 15 36 230 26 "username or user@domain.com"
 
-$lblFwdTo   = New-Label "Forward To (Internal UPN or External Email):" 265 15 300 20
-$txtFwdTo   = New-TextBox 265 36 280 26 "dest@domain.com"
+$lblFwdTo   = New-Label "Forward To (UPN, Username, or External Email):" 265 15 320 20
+$txtFwdTo   = New-TextBox 265 36 280 26 "username or dest@domain.com"
 
 $chkKeepCopy = New-Object System.Windows.Forms.CheckBox
 $chkKeepCopy.Text      = "Keep a copy in the original mailbox (Deliver & Forward)"
@@ -580,12 +610,12 @@ $chkKeepCopy.Size      = [System.Drawing.Size]::new(450, 22)
 $chkKeepCopy.ForeColor = $Theme.Text
 $chkKeepCopy.Checked   = $true
 
-$btnGetFwd = New-Button "📋 Get Forwarding"    15 118 155 34 $Theme.Panel
-$btnSetFwd = New-Button "✅ Set Forwarding"    185 118 155 34 $Theme.Accent
-$btnRemFwd = New-Button "🗑 Remove Forwarding" 355 118 155 34 $Theme.Error
+$btnGetFwd = New-Button "Get Forwarding"    15 118 155 34 $Theme.Panel
+$btnSetFwd = New-Button "Set Forwarding"    185 118 155 34 $Theme.Accent
+$btnRemFwd = New-Button "Remove Forwarding" 355 118 155 34 $Theme.Error
 
 $btnGetFwd.Add_Click({
-    $mbx = Get-TextValue $txtFwdMbx
+    $mbx = Resolve-Identity (Get-TextValue $txtFwdMbx)
     if (-not $mbx) { Write-Log "Mailbox required." $Theme.Warning; return }
     Invoke-ExchangeCommand -ActionName 'Get Forwarding' -Variables @{ mbx=$mbx } -ScriptBlock {
         Write-Output '__CLEARGRID__'
@@ -596,24 +626,24 @@ $btnGetFwd.Add_Click({
             $fwdTarget = if ($result.ForwardingSmtpAddress) { $result.ForwardingSmtpAddress } else { $result.ForwardingAddress }
             $keepCopy  = $result.DeliverToMailboxAndForward
             Write-Output "__ROW__|$mbx|Forwarding|$fwdTarget|KeepCopy:$keepCopy"
-            Write-Output "Forwarding active: $mbx → $fwdTarget (KeepCopy: $keepCopy)"
+            Write-Output "Forwarding active: $mbx -> $fwdTarget (KeepCopy: $keepCopy)"
         }
     }
 })
 
 $btnSetFwd.Add_Click({
-    $mbx  = Get-TextValue $txtFwdMbx
-    $fwd  = Get-TextValue $txtFwdTo
+    $mbx  = Resolve-Identity (Get-TextValue $txtFwdMbx)
+    $fwd  = Resolve-Identity (Get-TextValue $txtFwdTo)
     $keep = $chkKeepCopy.Checked
     if (-not $mbx -or -not $fwd) { Write-Log "Mailbox and Forward Address required." $Theme.Warning; return }
     Invoke-ExchangeCommand -ActionName 'Set Forwarding' -Variables @{ mbx=$mbx; fwd=$fwd; keep=$keep } -ScriptBlock {
         Set-Mailbox -Identity $mbx -ForwardingSmtpAddress $fwd -DeliverToMailboxAndForward $keep -ErrorAction Stop
-        Write-Output "Forwarding set: $mbx → $fwd | Keep copy: $keep"
+        Write-Output "Forwarding set: $mbx -> $fwd | Keep copy: $keep"
     }
 })
 
 $btnRemFwd.Add_Click({
-    $mbx = Get-TextValue $txtFwdMbx
+    $mbx = Resolve-Identity (Get-TextValue $txtFwdMbx)
     if (-not $mbx) { Write-Log "Mailbox required." $Theme.Warning; return }
     Invoke-ExchangeCommand -ActionName 'Remove Forwarding' -Variables @{ mbx=$mbx } -ScriptBlock {
         Set-Mailbox -Identity $mbx -ForwardingSmtpAddress $null -ForwardingAddress $null -DeliverToMailboxAndForward $false -ErrorAction Stop
@@ -622,7 +652,7 @@ $btnRemFwd.Add_Click({
 })
 
 $sep2 = New-Separator 15 168 730
-$lblFwdNote = New-Label "⚠ Warning: Setting external SMTP forwarding may be blocked by your tenant's outbound spam policy. Use internal forwarding addresses where possible." 15 176 700 36
+$lblFwdNote = New-Label "Warning: Setting external SMTP forwarding may be blocked by your tenant's outbound spam policy. Use internal forwarding addresses where possible." 15 176 700 36
 $lblFwdNote.ForeColor = $Theme.Warning
 $lblFwdNote.Font      = [System.Drawing.Font]::new("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
 
@@ -631,20 +661,20 @@ $TabFwd.Controls.AddRange(@($lblFwdMbx,$txtFwdMbx,$lblFwdTo,$txtFwdTo,$chkKeepCo
 # ==============================================================================
 # 10. TAB 4 — Distribution Groups
 # ==============================================================================
-$TabGroups = New-Tab "👥 Distribution Groups"
+$TabGroups = New-Tab "Distribution Groups"
 
 $lblGrpName  = New-Label "Group Email or Alias:" 15 15 220 20
-$txtGrpName  = New-TextBox 15 36 250 26 "group@domain.com"
+$txtGrpName  = New-TextBox 15 36 250 26 "groupname or group@domain.com"
 
 $lblGrpUser  = New-Label "User to Add / Remove:" 285 15 220 20
-$txtGrpUser  = New-TextBox 285 36 250 26 "user@domain.com"
+$txtGrpUser  = New-TextBox 285 36 250 26 "username or user@domain.com"
 
-$btnGetMembers  = New-Button "📋 List Members"   15 90 148 34 $Theme.Panel
-$btnAddMember   = New-Button "✅ Add Member"      178 90 148 34 $Theme.Accent
-$btnRemMember   = New-Button "🗑 Remove Member"   340 90 148 34 $Theme.Error
+$btnGetMembers  = New-Button "List Members"   15 90 148 34 $Theme.Panel
+$btnAddMember   = New-Button "Add Member"      178 90 148 34 $Theme.Accent
+$btnRemMember   = New-Button "Remove Member"   340 90 148 34 $Theme.Error
 
 $btnGetMembers.Add_Click({
-    $grp = Get-TextValue $txtGrpName
+    $grp = Resolve-Identity (Get-TextValue $txtGrpName)
     if (-not $grp) { Write-Log "Group name required." $Theme.Warning; return }
     Invoke-ExchangeCommand -ActionName 'List Members' -Variables @{ grp=$grp } -ScriptBlock {
         Write-Output '__CLEARGRID__'
@@ -653,13 +683,13 @@ $btnGetMembers.Add_Click({
         foreach ($m in $members) {
             Write-Output "__ROW__|$grp|GroupMember|$($m.PrimarySmtpAddress)|$($m.DisplayName)"
         }
-        Write-Output "Group '$grp' — $(@($members).Count) member(s) loaded."
+        Write-Output "Group '$grp' - $(@($members).Count) member(s) loaded."
     }
 })
 
 $btnAddMember.Add_Click({
-    $grp  = Get-TextValue $txtGrpName
-    $user = Get-TextValue $txtGrpUser
+    $grp  = Resolve-Identity (Get-TextValue $txtGrpName)
+    $user = Resolve-Identity (Get-TextValue $txtGrpUser)
     if (-not $grp -or -not $user) { Write-Log "Group and User required." $Theme.Warning; return }
     Invoke-ExchangeCommand -ActionName 'Add Member' -Variables @{ grp=$grp; user=$user } -ScriptBlock {
         Add-DistributionGroupMember -Identity $grp -Member $user -Confirm:$false -ErrorAction Stop
@@ -668,8 +698,8 @@ $btnAddMember.Add_Click({
 })
 
 $btnRemMember.Add_Click({
-    $grp  = Get-TextValue $txtGrpName
-    $user = Get-TextValue $txtGrpUser
+    $grp  = Resolve-Identity (Get-TextValue $txtGrpName)
+    $user = Resolve-Identity (Get-TextValue $txtGrpUser)
     if (-not $grp -or -not $user) { Write-Log "Group and User required." $Theme.Warning; return }
     Invoke-ExchangeCommand -ActionName 'Remove Member' -Variables @{ grp=$grp; user=$user } -ScriptBlock {
         Remove-DistributionGroupMember -Identity $grp -Member $user -Confirm:$false -ErrorAction Stop
@@ -682,17 +712,17 @@ $TabGroups.Controls.AddRange(@($lblGrpName,$txtGrpName,$lblGrpUser,$txtGrpUser,$
 # ==============================================================================
 # 11. TAB 5 — Mailbox Conversion
 # ==============================================================================
-$TabShared = New-Tab "🔄 Mailbox Conversion"
+$TabShared = New-Tab "Mailbox Conversion"
 
-$lblConvMbx  = New-Label "Target Mailbox (UPN or Alias):" 15 15 280 20
-$txtConvMbx  = New-TextBox 15 36 280 26 "user@domain.com"
+$lblConvMbx  = New-Label "Target Mailbox (UPN or Username):" 15 15 280 20
+$txtConvMbx  = New-TextBox 15 36 280 26 "username or user@domain.com"
 
-$btnGetType   = New-Button "🔍 Check Type"          15 90 148 34 $Theme.Panel
-$btnToShared  = New-Button "📦 Convert to Shared"   178 90 170 34 $Theme.Accent
-$btnToReg     = New-Button "👤 Convert to Regular"  362 90 170 34 $Theme.Panel
+$btnGetType   = New-Button "Check Type"          15 90 148 34 $Theme.Panel
+$btnToShared  = New-Button "Convert to Shared"   178 90 170 34 $Theme.Accent
+$btnToReg     = New-Button "Convert to Regular"  362 90 170 34 $Theme.Panel
 
 $btnGetType.Add_Click({
-    $mbx = Get-TextValue $txtConvMbx
+    $mbx = Resolve-Identity (Get-TextValue $txtConvMbx)
     if (-not $mbx) { Write-Log "Mailbox required." $Theme.Warning; return }
     Invoke-ExchangeCommand -ActionName 'Get Mailbox Type' -Variables @{ mbx=$mbx } -ScriptBlock {
         Get-Mailbox -Identity $mbx | Select-Object DisplayName, PrimarySmtpAddress, RecipientTypeDetails, IsShared | Format-List
@@ -700,7 +730,7 @@ $btnGetType.Add_Click({
 })
 
 $btnToShared.Add_Click({
-    $mbx = Get-TextValue $txtConvMbx
+    $mbx = Resolve-Identity (Get-TextValue $txtConvMbx)
     if (-not $mbx) { Write-Log "Mailbox required." $Theme.Warning; return }
     $confirm = [System.Windows.Forms.MessageBox]::Show(
         "Convert '$mbx' to a Shared Mailbox?`n`nNote: The user's license can be removed after conversion.",
@@ -713,7 +743,7 @@ $btnToShared.Add_Click({
 })
 
 $btnToReg.Add_Click({
-    $mbx = Get-TextValue $txtConvMbx
+    $mbx = Resolve-Identity (Get-TextValue $txtConvMbx)
     if (-not $mbx) { Write-Log "Mailbox required." $Theme.Warning; return }
     $confirm = [System.Windows.Forms.MessageBox]::Show(
         "Convert '$mbx' to a Regular (User) Mailbox?`n`nNote: A valid license must be assigned after conversion.",
@@ -726,7 +756,7 @@ $btnToReg.Add_Click({
 })
 
 $sep3 = New-Separator 15 140 730
-$lblConvNote = New-Label "💡 After converting to Shared: sign into M365 Admin Center to remove the user license (saves cost). The mailbox remains accessible." 15 148 700 36
+$lblConvNote = New-Label "After converting to Shared: sign into M365 Admin Center to remove the user license (saves cost). The mailbox remains accessible." 15 148 700 36
 $lblConvNote.ForeColor = $Theme.TextDark
 $lblConvNote.Font      = [System.Drawing.Font]::new("Segoe UI", 8, [System.Drawing.FontStyle]::Italic)
 
@@ -735,15 +765,15 @@ $TabShared.Controls.AddRange(@($lblConvMbx,$txtConvMbx,$btnGetType,$btnToShared,
 # ==============================================================================
 # 12. TAB 6 — Bulk Operations
 # ==============================================================================
-$TabBulk = New-Tab "📂 Bulk Operations"
+$TabBulk = New-Tab "Bulk Operations"
 
-$lblBulkInfo = New-Label "CSV Format  —  Required columns:  Mailbox, Target, Permission  (one row per operation)" 15 15 700 20
+$lblBulkInfo = New-Label "CSV Format  -  Required columns:  Mailbox, Target, Permission  (one row per operation)" 15 15 700 20
 $lblBulkInfo.ForeColor = $Theme.TextDark
 
 $lblBulkFile = New-Label "CSV File Path:" 15 50 150 20
 $txtBulkFile = New-TextBox 15 70 480 26 "C:\path\to\bulk_operations.csv"
 
-$btnBrowseCSV = New-Button "📁 Browse" 510 68 100 28 $Theme.Panel
+$btnBrowseCSV = New-Button "Browse" 510 68 100 28 $Theme.Panel
 $btnBrowseCSV.Font = [System.Drawing.Font]::new("Segoe UI", 8)
 $btnBrowseCSV.Add_Click({
     $dlg = New-Object System.Windows.Forms.OpenFileDialog
@@ -758,8 +788,8 @@ $btnBrowseCSV.Add_Click({
 $lblBulkAction = New-Label "Bulk Action:" 15 112 120 20
 $cmbBulkAction = New-ComboBox 15 132 200 26 @("Add Permission","Remove Permission","Set Forwarding","Add Group Member","Remove Group Member")
 
-$btnPreviewCSV = New-Button "👁 Preview CSV"    15 178 140 34 $Theme.Panel
-$btnRunBulk    = New-Button "▶ Run Bulk Job"   170 178 140 34 $Theme.Accent
+$btnPreviewCSV = New-Button "Preview CSV"    15 178 140 34 $Theme.Panel
+$btnRunBulk    = New-Button "Run Bulk Job"   170 178 140 34 $Theme.Accent
 $lblBulkStatus = New-Label "" 330 185 380 22
 $lblBulkStatus.ForeColor = $Theme.TextDark
 
@@ -798,10 +828,10 @@ $btnRunBulk.Add_Click({
                     "Add Group Member"     { Add-DistributionGroupMember    -Identity $row.Mailbox -Member $row.Target -Confirm:$false }
                     "Remove Group Member"  { Remove-DistributionGroupMember -Identity $row.Mailbox -Member $row.Target -Confirm:$false }
                 }
-                Write-Output "  ✔ $($row.Mailbox)"
+                Write-Output "  OK: $($row.Mailbox)"
                 $success++
             } catch {
-                Write-Output "  ✖ $($row.Mailbox) — $($_.Exception.Message)"
+                Write-Output "  FAIL: $($row.Mailbox) - $($_.Exception.Message)"
                 $fail++
             }
         }
@@ -830,7 +860,7 @@ $ResultsPanel.Location = [System.Drawing.Point]::new(10, 485)
 $ResultsPanel.Size     = [System.Drawing.Size]::new(780, 170)
 $ResultsPanel.BackColor = $Theme.Panel
 $ResultsPanel.Anchor   = "Top, Left, Right"
-$ResultsPanel.Visible  = $false   # Hidden until a search populates it
+$ResultsPanel.Visible  = $false
 
 $ResultsHeaderPanel          = New-Object System.Windows.Forms.Panel
 $ResultsHeaderPanel.Location = [System.Drawing.Point]::new(0, 0)
@@ -841,7 +871,7 @@ $ResultsHeaderLabel      = New-Label "Current Delegates" 8 5 500 20
 $ResultsHeaderLabel.Font = [System.Drawing.Font]::new("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
 $ResultsHeaderPanel.Controls.Add($ResultsHeaderLabel)
 
-$btnRemoveSelected      = New-Button "🗑 Remove Selected" 580 2 170 24 $Theme.Error
+$btnRemoveSelected      = New-Button "Remove Selected" 580 2 170 24 $Theme.Error
 $btnRemoveSelected.Font = [System.Drawing.Font]::new("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
 $btnRemoveSelected.Add_Click({
     $selected = $ResultsGrid.SelectedItems
@@ -851,11 +881,10 @@ $btnRemoveSelected.Add_Click({
     }
 
     $confirmMsg = "Remove $($selected.Count) selected permission(s)?`n"
-    foreach ($row in $selected) { $confirmMsg += "`n  • $($row.SubItems[1].Text): $($row.SubItems[2].Text) on $($row.SubItems[0].Text)" }
+    foreach ($row in $selected) { $confirmMsg += "`n  $($row.SubItems[1].Text): $($row.SubItems[2].Text) on $($row.SubItems[0].Text)" }
     $confirm = [System.Windows.Forms.MessageBox]::Show($confirmMsg, "Confirm Removal", "YesNo", "Warning")
     if ($confirm -ne "Yes") { return }
 
-    # Build a list of plain objects to pass into the runspace (avoid passing COM/WinForms objects)
     $removeList = @()
     foreach ($row in $selected) {
         $removeList += [PSCustomObject]@{
@@ -885,24 +914,23 @@ $btnRemoveSelected.Add_Click({
                         }
                     }
                 }
-                Write-Output "  ✔ Removed $($item.PermType) for $($item.Target) on $($item.Mailbox)"
+                Write-Output "  OK: Removed $($item.PermType) for $($item.Target) on $($item.Mailbox)"
             } catch {
-                Write-Output "  ✖ Failed $($item.PermType) for $($item.Target): $($_.Exception.Message)"
+                Write-Output "  FAIL: $($item.PermType) for $($item.Target): $($_.Exception.Message)"
             }
         }
     }
 
-    # Optimistically remove confirmed rows from the grid immediately
     $Form.Invoke([action]{
         foreach ($row in @($selected)) { $ResultsGrid.Items.Remove($row) }
         $remaining = $ResultsGrid.Items.Count
-        $ResultsHeaderLabel.Text = "Current Delegates  ($remaining entries — select rows to remove)"
+        $ResultsHeaderLabel.Text = "Current Delegates  ($remaining entries - select rows to remove)"
         if ($remaining -eq 0) { $ResultsPanel.Visible = $false }
     })
 })
 $ResultsHeaderPanel.Controls.Add($btnRemoveSelected)
 
-$btnClearResults      = New-Button "✖ Clear" 510 2 64 24 $Theme.Panel
+$btnClearResults      = New-Button "Clear" 510 2 64 24 $Theme.Panel
 $btnClearResults.Font = [System.Drawing.Font]::new("Segoe UI", 8)
 $btnClearResults.Add_Click({
     $ResultsGrid.Items.Clear()
@@ -931,7 +959,6 @@ $col3 = New-Object System.Windows.Forms.ColumnHeader; $col3.Text = "User / Trust
 $col4 = New-Object System.Windows.Forms.ColumnHeader; $col4.Text = "Details";           $col4.Width = 190
 $ResultsGrid.Columns.AddRange(@($col1,$col2,$col3,$col4))
 
-# Highlight selected rows in accent blue
 $ResultsGrid.Add_SelectedIndexChanged({
     $btnRemoveSelected.BackColor = if ($ResultsGrid.SelectedItems.Count -gt 0) {
         [System.Drawing.ColorTranslator]::FromHtml("#DC3545")
@@ -943,7 +970,6 @@ $ResultsGrid.Add_SelectedIndexChanged({
 $ResultsPanel.Controls.AddRange(@($ResultsHeaderPanel, $ResultsGrid))
 $Form.Controls.Add($ResultsPanel)
 
-# Reposition log panel whenever results panel shows/hides
 $ResultsPanel.Add_VisibleChanged({
     if ($ResultsPanel.Visible) {
         $LogPanel.Location = [System.Drawing.Point]::new(10, 665)
@@ -968,8 +994,7 @@ $LogLabel          = New-Label "Operation Log" 8 5 160 20
 $LogLabel.Font     = [System.Drawing.Font]::new("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
 $LogHeaderPanel.Controls.Add($LogLabel)
 
-# Save Log button
-$btnSaveLog          = New-Button "💾 Save Log" 640 2 110 24 $Theme.Panel
+$btnSaveLog          = New-Button "Save Log" 640 2 110 24 $Theme.Panel
 $btnSaveLog.Font     = [System.Drawing.Font]::new("Segoe UI", 8)
 $btnSaveLog.Add_Click({
     $dlg = New-Object System.Windows.Forms.SaveFileDialog
@@ -982,8 +1007,7 @@ $btnSaveLog.Add_Click({
 })
 $LogHeaderPanel.Controls.Add($btnSaveLog)
 
-# Clear Log button
-$btnClearLog      = New-Button "🗑 Clear" 560 2 75 24 $Theme.Panel
+$btnClearLog      = New-Button "Clear" 560 2 75 24 $Theme.Panel
 $btnClearLog.Font = [System.Drawing.Font]::new("Segoe UI", 8)
 $btnClearLog.Add_Click({ $LogBox.Clear() })
 $LogHeaderPanel.Controls.Add($btnClearLog)
@@ -1020,7 +1044,7 @@ $script:SessionTimer          = New-Object System.Windows.Forms.Timer
 $script:SessionTimer.Interval = 3000000  # 50 minutes
 $script:SessionTimer.add_Tick({
     if ($script:IsConnected) {
-        Write-Log "⚠ WARNING: Exchange Online session may be near expiry (50 min). Consider reconnecting." $Theme.Warning
+        Write-Log "WARNING: Exchange Online session may be near expiry (50 min). Consider reconnecting." $Theme.Warning
     }
 })
 
@@ -1035,17 +1059,16 @@ $Form.Add_FormClosing({
 
 $Form.Add_Shown({
     $script:SessionTimer.Start()
-    # Initial module check — non-blocking, informational
     if (-not (Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
-        Write-Log "⚠ ExchangeOnlineManagement module not found." ([System.Drawing.ColorTranslator]::FromHtml("#DC3545")) -NoFile
+        Write-Log "ExchangeOnlineManagement module not found." ([System.Drawing.ColorTranslator]::FromHtml("#DC3545")) -NoFile
         Write-Log "  Run in an elevated PowerShell window:" ([System.Drawing.ColorTranslator]::FromHtml("#FFC107")) -NoFile
         Write-Log "  Install-Module ExchangeOnlineManagement -Force" ([System.Drawing.ColorTranslator]::FromHtml("#FFC107")) -NoFile
     } else {
         $modVer = (Get-Module -ListAvailable -Name ExchangeOnlineManagement | Sort-Object Version -Descending | Select-Object -First 1).Version
-        Write-Log "✔ ExchangeOnlineManagement v$modVer found. Ready to connect." ([System.Drawing.ColorTranslator]::FromHtml("#28A745")) -NoFile
+        Write-Log "ExchangeOnlineManagement v$modVer found. Ready to connect." ([System.Drawing.ColorTranslator]::FromHtml("#28A745")) -NoFile
     }
-    # Use Get-Variable with -ErrorAction to safely read script-scoped var inside event handler
-    $logPath = Get-Variable -Name 'LogFilePath' -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+    $logPath = $null
+    try { $logPath = Get-Variable -Name 'LogFilePath' -Scope Script -ValueOnly -ErrorAction SilentlyContinue } catch {}
     if ($logPath) {
         Write-Log "Session log: $logPath" ([System.Drawing.ColorTranslator]::FromHtml("#CCCCCC")) -NoFile
     }
